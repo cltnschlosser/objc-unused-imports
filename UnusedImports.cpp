@@ -638,12 +638,41 @@ public:
         addSymbolIfMain(fullLocation, definitionSymbol, className.str());
 
         QualType returnType = declaration->getReturnType();
-        if (returnType.isNull()) {
-          return true;
+        if (!returnType.isNull()) {
+          Symbol returnSymbol = Symbol(SymbolType::Type, qualTypeSimple(returnType));
+          addSymbolIfMain(fullLocation, returnSymbol);
         }
 
-        Symbol returnSymbol = Symbol(SymbolType::Type, qualTypeSimple(returnType));
-        addSymbolIfMain(fullLocation, returnSymbol);
+        // This is terrible, but it's only here because we do "casts" to add protocol conformance (this really can't be safe).
+        for (ParmVarDecl *param : declaration->parameters()) {
+          QualType qualType = param->getOriginalType();
+          if (qualType.isNull()) {
+            continue;
+          }
+          const clang::Type *typePtr = qualType.getTypePtr();
+          if (!typePtr) {
+            continue;
+          }
+          auto string = qualTypeSimple(qualType);
+          size_t index = 0;
+          while (true) {
+            auto end_index = string.find(',', index);
+            std::string partial_string;
+            if (end_index == std::string::npos) {
+              partial_string = string.substr(index);
+            } else {
+              auto length = end_index - index;
+              partial_string = string.substr(index, length);
+            }
+            Symbol protocolSymbol = Symbol(SymbolType::Type, partial_string);
+            addSymbolIfMain(fullLocation, protocolSymbol);
+            if (end_index == std::string::npos) {
+              break;
+            }
+            index = end_index + 1;
+          }
+        }
+
         return true;
       } else {
         const char *kindName = parent->getDeclKindName();
@@ -688,6 +717,19 @@ public:
       return true;
     }
 
+    // Handle return type
+    if (const ObjCMethodDecl *methodDecl = expression->getMethodDecl()) {
+      QualType returnType = methodDecl->getReturnType();
+      if (auto *returnTypePtr = returnType.getTypePtrOrNull()) {
+        if (returnTypePtr->isObjCObjectPointerType()
+         && !returnTypePtr->isObjCIdType()
+         && !returnTypePtr->isObjCClassOrClassKindOfType()) {
+          Symbol typeSymbol = Symbol(SymbolType::Type, qualTypeSimple(returnType));
+          addSymbolIfMain(fullLocation, typeSymbol);
+        }
+      }
+    }
+
     // HACK: use base type if not id, otherwise you subtype (assume protocol)
     if (auto *receiverTypePtr = receiverType.getTypePtr()) {
       if (auto *receiverClass = receiverTypePtr->getAsObjCInterfaceType()) {
@@ -709,6 +751,19 @@ public:
             Symbol typeSymbol = Symbol(SymbolType::Type, qualTypeSimple(baseType));
             addSymbolIfMain(fullLocation, typeSymbol);
           }
+        }
+      } else if (receiverTypePtr->isObjCClassType()) {
+        if (auto *receiverExpr = expression->getInstanceReceiver()) {
+          if (PseudoObjectExpr *pseudoExpr = dyn_cast<PseudoObjectExpr>(receiverExpr)) {
+            if (auto *propertyRefExpr = dyn_cast<ObjCPropertyRefExpr>(pseudoExpr->getSyntacticForm())) {
+              QualType realType = propertyRefExpr->getReceiverType(*context);
+              if (!realType.isNull()) {
+                Symbol symbol = Symbol(SymbolType::Method, selector.getAsString());
+                addSymbolIfMain(fullLocation, symbol, qualTypeSimple(realType));
+              }
+            }
+          }
+          // Might need to add other types here in the future
         }
       }
     }
@@ -908,7 +963,7 @@ private:
   }
 
   std::string qualTypeSimple(QualType type) {
-    std::string fullString = type.getUnqualifiedType().getAsString();
+    std::string fullString = type.stripObjCKindOfType(*context).getUnqualifiedType().getAsString();
     std::string string = getUpToFirstSpace(fullString);
     auto start_index = string.find_first_of('<');
     if (start_index == std::string::npos) {
